@@ -1,5 +1,9 @@
+python-pptx
+Pillow
 transformers
 torch
-Pillow
-pytesseract
 easyocr
+paddleocr
+paddlepaddle
+numpy
+requests
