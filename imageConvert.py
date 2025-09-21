@@ -1,33 +1,148 @@
-#BlipForConditional has the pretrained model while the other is for preparing the image and text
+import warnings
+warnings.filterwarnings("ignore")
+
+import easyocr
+import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from PIL import Image
-import pytesseract #OCR extraction
+import json, re
 
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base") #Processor for converting image and text to tensors for the model
-model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base") #loading the actual model
-def describe_image_and_context(image_path):
+# ---------- LOAD MODELS ----------
+ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    "Salesforce/blip-image-captioning-base"
+).to(device)
+
+# ---------- SCENE HANDLER ----------
+def describe_scene(image_path, raw_text):
     img = Image.open(image_path).convert("RGB")
+    inputs = blip_processor(img, return_tensors="pt").to(device)
+    caption_ids = blip_model.generate(**inputs, max_new_tokens=50)
+    caption = blip_processor.decode(caption_ids[0], skip_special_tokens=True)
+    if raw_text:
+        caption += f". The image also shows the text: '{raw_text}'"
+    return caption
 
-    # OCR step
-    img_for_ocr = img.convert("L")
-    ocr_text = pytesseract.image_to_string(img_for_ocr, lang="eng").strip()
+# ---------- LOGBOOK HANDLER (Bounding-Box Parsing) ----------
+def extract_logbook_structured(image_path):
+    results = ocr_reader.readtext(image_path)  # [(bbox, text, conf), ...]
 
-    # Scene caption
-    inputs_scene = processor(images=img, return_tensors="pt")
-    out_scene = model.generate(**inputs_scene, max_length=50, num_beams=5)
-    scene_caption = processor.decode(out_scene[0], skip_special_tokens=True)
+    # --- Step 1: Collect rows by Y alignment ---
+    rows = {}
+    for (bbox, text, conf) in results:
+        if conf < 0.4:
+            continue
+        y_center = (bbox[0][1] + bbox[2][1]) / 2
+        row_key = round(y_center / 20)
+        rows.setdefault(row_key, []).append((bbox, text))
 
-    # Natural integration
-    if ocr_text and len(ocr_text) > 3:
-        keywords = ["sign", "board", "bus", "poster", "label", "paper", "building"]
-        if any(word in scene_caption.lower() for word in keywords):
-            final_caption = scene_caption + f" labeled '{ocr_text}'"
+    structured = []
+    for row_key in sorted(rows.keys()):
+        row_items = sorted(rows[row_key], key=lambda x: x[0][0][0])  # left-to-right
+        fields = [text for _, text in row_items]
+        if len(fields) >= 2:
+            structured.append((row_items, fields))
+
+    # --- Step 2: Detect header row ---
+    headers = None
+    data_rows = []
+    for (row_items, fields) in structured:
+        joined = " ".join(fields).lower()
+        if any(h in joined for h in ["date", "name", "reason", "time", "sign"]):
+            # Save header positions (X midpoint of each word)
+            headers = [( (bbox[0][0] + bbox[2][0]) / 2, text.lower()) for bbox, text in row_items]
         else:
-            final_caption = scene_caption + f", with the text '{ocr_text}' visible"
+            data_rows.append((row_items, fields))
+
+    # --- Step 3: Assign words to nearest header ---
+    parsed_rows = []
+    if headers:
+        header_positions = [pos for pos, h in headers]
+        header_names = [h for _, h in headers]
+
+        for (row_items, fields) in data_rows:
+            row_dict = {h: "" for h in header_names}
+            for bbox, text in row_items:
+                x_center = (bbox[0][0] + bbox[2][0]) / 2
+                # Assign to nearest header column
+                nearest_idx = min(range(len(header_positions)), key=lambda i: abs(header_positions[i]-x_center))
+                row_dict[header_names[nearest_idx]] += (" " + text).strip()
+            parsed_rows.append(row_dict)
+
+    return parsed_rows
+
+# ---------- DOCUMENT HANDLER ----------
+def parse_document_text(image_path):
+    results = ocr_reader.readtext(image_path, detail=0)
+    raw_text = " ".join(results).strip()
+    return {"raw_text": raw_text}
+
+# ---------- IAM POLICY CLEANUP ----------
+def clean_iam_text(raw_text: str) -> str:
+    fixed = raw_text
+    fixed = fixed.replace("53:", "s3:").replace("S3:", "s3:").replace(" 53", " s3")
+    fixed = fixed.replace("Effect ;", "Effect:").replace("Action ;", "Action:")
+    fixed = fixed.replace("Resource ;", "Resource:")
+
+    # Restore wildcard if OCR missed it
+    if 'Resource' in fixed and '*' not in fixed:
+        fixed = re.sub(r'(Resource"\s*:\s*")([^"]*)(")', r'\1*\3', fixed)
+
+    return fixed
+
+def parse_iam_policy(raw_text):
+    cleaned = clean_iam_text(raw_text)
+
+    try:
+        policy = json.loads(cleaned)
+        return {"format": "json", "policy": policy}
+    except Exception:
+        if "Effect" in cleaned and "Action" in cleaned:
+            lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+            return {"format": "yaml-like", "policy": lines}
+    return {"raw_text": raw_text, "cleaned_text": cleaned}
+
+# ---------- CLASSIFIER ----------
+def classify_image_type(raw_text):
+    if re.search(r'\"Version\"|\"Statement\"|Effect:|Action:|Resource:', raw_text):
+        return "policy"
+    doc_keywords = ["log book", "invoice", "certificate", "report", "date", "reason"]
+    if any(kw in raw_text.lower() for kw in doc_keywords) or len(raw_text.split()) > 20:
+        return "document"
+    return "scene"
+
+# ---------- MAIN PIPELINE ----------
+def analyze_image(image_path):
+    ocr_result = ocr_reader.readtext(image_path, detail=0)
+    raw_text = " ".join(ocr_result).strip()
+
+    img_type = classify_image_type(raw_text)
+
+    if img_type == "scene":
+        return {"type": "scene", "output": describe_scene(image_path, raw_text)}
+
+    elif img_type == "policy":
+        return {"type": "policy", "output": parse_iam_policy(raw_text)}
+
     else:
-        final_caption = scene_caption
+        if "log book" in raw_text.lower():
+            return {"type": "document", "output": extract_logbook_structured(image_path)}
+        else:
+            return {"type": "document", "output": parse_document_text(image_path)}
 
-    return final_caption
+# ---------- RUN ----------
+if __name__ == "__main__":
+    test_images = [
+        "Files/File_003.png",  # Scene
+        "Files/File_011.png",  # Logbook
+        "Files/File_013.png",  # Certificate
+        "Files/File_015.jpg" # IAM policy screenshot
+    ]
 
-
-print(describe_image_and_context("Files/File_005.png"))
+    for img in test_images:
+        print(f"\n--- {img} ---")
+        result = analyze_image(img)
+        print(result)
