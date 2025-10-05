@@ -7,16 +7,17 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 from PIL import Image
 import json, re
 
-# ---------- LOAD MODELS ----------
+#Loading the necessary models
 ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
 
+#Check if GPU can be used, otherwise use CPU itself and load the models
 device = "cuda" if torch.cuda.is_available() else "cpu"
 blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 blip_model = BlipForConditionalGeneration.from_pretrained(
     "Salesforce/blip-image-captioning-base"
 ).to(device)
 
-# ---------- SCENE HANDLER ----------
+#Describe the scene and return the caption
 def describe_scene(image_path, raw_text):
     img = Image.open(image_path).convert("RGB")
     inputs = blip_processor(img, return_tensors="pt").to(device)
@@ -26,12 +27,13 @@ def describe_scene(image_path, raw_text):
         caption += f". The image also shows the text: '{raw_text}'"
     return caption
 
-# ---------- LOGBOOK HANDLER (Bounding-Box Parsing) ----------
+#Describe logbook and return the text associated with each row
 def extract_logbook_structured(image_path):
     results = ocr_reader.readtext(image_path)  # [(bbox, text, conf), ...]
 
-    # --- Step 1: Collect rows by Y alignment ---
+    
     rows = {}
+    #Align rows based on average Y coordinate
     for (bbox, text, conf) in results:
         if conf < 0.4:
             continue
@@ -40,13 +42,14 @@ def extract_logbook_structured(image_path):
         rows.setdefault(row_key, []).append((bbox, text))
 
     structured = []
+    #Store the data associated with each row in order based on top-left coordinates
     for row_key in sorted(rows.keys()):
         row_items = sorted(rows[row_key], key=lambda x: x[0][0][0])  # left-to-right
         fields = [text for _, text in row_items]
         if len(fields) >= 2:
             structured.append((row_items, fields))
 
-    # --- Step 2: Detect header row ---
+    #Detect the header rows and extract it. Seperating it from the actual data to be passed on
     headers = None
     data_rows = []
     for (row_items, fields) in structured:
@@ -57,7 +60,7 @@ def extract_logbook_structured(image_path):
         else:
             data_rows.append((row_items, fields))
 
-    # --- Step 3: Assign words to nearest header ---
+    #Assign each word to the nearest header present
     parsed_rows = []
     if headers:
         header_positions = [pos for pos, h in headers]
@@ -67,32 +70,33 @@ def extract_logbook_structured(image_path):
             row_dict = {h: "" for h in header_names}
             for bbox, text in row_items:
                 x_center = (bbox[0][0] + bbox[2][0]) / 2
-                # Assign to nearest header column
+                
                 nearest_idx = min(range(len(header_positions)), key=lambda i: abs(header_positions[i]-x_center))
                 row_dict[header_names[nearest_idx]] += (" " + text).strip()
             parsed_rows.append(row_dict)
 
     return parsed_rows
 
-# ---------- DOCUMENT HANDLER ----------
+#Extracting the text from a normal document
 def parse_document_text(image_path):
     results = ocr_reader.readtext(image_path, detail=0)
     raw_text = " ".join(results).strip()
     return {"raw_text": raw_text}
 
-# ---------- IAM POLICY CLEANUP ----------
+#Clean IAM text extraction by replacing common mistakes
 def clean_iam_text(raw_text: str) -> str:
     fixed = raw_text
     fixed = fixed.replace("53:", "s3:").replace("S3:", "s3:").replace(" 53", " s3")
     fixed = fixed.replace("Effect ;", "Effect:").replace("Action ;", "Action:")
     fixed = fixed.replace("Resource ;", "Resource:")
 
-    # Restore wildcard if OCR missed it
+    #Restoring the * as its missed constantly by OCR
     if 'Resource' in fixed and '*' not in fixed:
         fixed = re.sub(r'(Resource"\s*:\s*")([^"]*)(")', r'\1*\3', fixed)
 
     return fixed
 
+#Extract the IAM policy in either a json or a yaml format
 def parse_iam_policy(raw_text):
     cleaned = clean_iam_text(raw_text)
 
@@ -105,7 +109,7 @@ def parse_iam_policy(raw_text):
             return {"format": "yaml-like", "policy": lines}
     return {"raw_text": raw_text, "cleaned_text": cleaned}
 
-# ---------- CLASSIFIER ----------
+#Classify the input image into a document type
 def classify_image_type(raw_text):
     if re.search(r'\"Version\"|\"Statement\"|Effect:|Action:|Resource:', raw_text):
         return "policy"
@@ -114,7 +118,7 @@ def classify_image_type(raw_text):
         return "document"
     return "scene"
 
-# ---------- MAIN PIPELINE ----------
+#Main function which gives the meaningful description based on the type of image
 def analyze_image(image_path):
     ocr_result = ocr_reader.readtext(image_path, detail=0)
     raw_text = " ".join(ocr_result).strip()
@@ -133,13 +137,13 @@ def analyze_image(image_path):
         else:
             return {"type": "document", "output": parse_document_text(image_path)}
 
-# ---------- RUN ----------
+
 if __name__ == "__main__":
     test_images = [
-        "Files/File_003.png",  # Scene
-        "Files/File_011.png",  # Logbook
-        "Files/File_013.png",  # Certificate
-        "Files/File_015.jpg" # IAM policy screenshot
+        "Files/File_001.png",  
+        "Files/File_002.png",  
+        "Files/File_004.png",  
+        "Files/File_005.png" 
     ]
 
     for img in test_images:
