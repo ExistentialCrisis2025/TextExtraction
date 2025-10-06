@@ -48,4 +48,5 @@ if __name__ == "__main__":
     content = extract_ppt_content(ppt_file)
 
     import json
-    print(json.dumps(content, indent=2))
+    with open(f"{ppt_file}.json","w") as json_file:
+            json.dump(content,json_file,indent=4)

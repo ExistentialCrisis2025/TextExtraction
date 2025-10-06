@@ -140,13 +140,15 @@ def analyze_image(image_path):
 
 if __name__ == "__main__":
     test_images = [
-        "Files/File_001.png",  
-        "Files/File_002.png",  
-        "Files/File_004.png",  
-        "Files/File_005.png" 
+        "Files/File_009.png",  
+        "Files/File_013.png",  
+        "Files/File_015.jpg",
     ]
 
     for img in test_images:
+        with open(f"{img}.json","w") as json_file:
+            result = analyze_image(img)
+            json.dump(result,json_file,indent=4)
         print(f"\n--- {img} ---")
         result = analyze_image(img)
         print(result)
